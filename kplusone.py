@@ -12,7 +12,6 @@ def get_device():
     if torch.backends.mps.is_available():
         device = torch.device('mps')
         print(f"MPS (Metal Performance Shaders) is available and will be used")
-        print(f"MPS device: {torch.backends.mps.get_device_name()}")
     else:
         device = torch.device('cpu')
         print("MPS not available, using CPU")
@@ -30,10 +29,10 @@ def get_cifar10_data(batch_size=64, num_workers=2):
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     ])
     
-    trainset = CIFAR10(root='/Users/mukher74/research/data', train=True, download=True, transform=transform_train)
+    trainset = CIFAR10(root='/Users/tanmoy/research/data', train=True, download=True, transform=transform_train)
     trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
     
-    testset = CIFAR10(root='/Users/mukher74/research/data', train=False, download=True, transform=transform_test)
+    testset = CIFAR10(root='/Users/tanmoy/research/data', train=False, download=True, transform=transform_test)
     testloader = DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     
     return trainloader, testloader
@@ -46,7 +45,7 @@ def get_svhn_data(batch_size=64, num_workers=2):
     ])
     
     # Use test set of SVHN as OOD data
-    oodset = SVHN(root='/Users/mukher74/research/data', split='test', download=True, transform=transform)
+    oodset = SVHN(root='/Users/tanmoy/research/data', split='test', download=True, transform=transform)
     oodloader = DataLoader(oodset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     
     return oodloader
@@ -121,7 +120,7 @@ class VirtualKPlusOneDRO(nn.Module):
         self.alpha = alpha  # Weight for DRO regularization
         
         # Ensure classifier has K+1 outputs
-        assert classifier.fc.out_features == num_classes + 1
+        assert classifier.classifier[-1].out_features == num_classes + 1
     
     def generate_virtual_ood_from_uncertainty_set(self, x, y):
         """
@@ -131,7 +130,8 @@ class VirtualKPlusOneDRO(nn.Module):
         x.requires_grad_(True)
         
         # Compute loss gradients for worst-case direction
-        logits = self.classifier(x)[:, :-1]  # Only original K classes
+        logits, _ = self.classifier(x)  # Extract logits from tuple
+        logits = logits[:, :-1]  # Only original K classes
         ce_loss = F.cross_entropy(logits, y, reduction='none')
         
         # Gradient gives worst-case perturbation direction
@@ -179,23 +179,24 @@ class VirtualKPlusOneDRO(nn.Module):
             y_combined = y
         
         # K+1 classification loss
-        logits = self.classifier(x_combined)
+        logits, _ = self.classifier(x_combined)  # Extract logits from tuple
         k_plus_one_loss = F.cross_entropy(logits, y_combined)
         
         # DRO regularization on original samples
         x.requires_grad_(True)
-        orig_logits = self.classifier(x)[:, :-1]  # Only K classes for DRO
-        orig_ce_loss = F.cross_entropy(orig_logits, y, reduction='none')
+        orig_logits, _ = self.classifier(x)  # Extract logits from tuple
+        orig_logits = orig_logits[:, :-1]  # Only K classes for DRO
+        orig_loss = F.cross_entropy(orig_logits, y, reduction='none')
         
         gradients = torch.autograd.grad(
-            outputs=orig_ce_loss.sum(),
+            outputs=orig_loss.sum(),
             inputs=x,
             create_graph=True,
             retain_graph=True
         )[0]
         
         grad_penalty = torch.norm(gradients.view(gradients.size(0), -1), p=2, dim=1)
-        dro_regularization = (orig_ce_loss + self.epsilon * grad_penalty).mean()
+        dro_regularization = (orig_loss + self.epsilon * grad_penalty).mean()
         
         # Combined loss: K+1 classification + DRO regularization
         total_loss = k_plus_one_loss + self.alpha * dro_regularization
@@ -207,7 +208,7 @@ class VirtualKPlusOneDRO(nn.Module):
         """
         Compute OOD score based on K+1 classification
         """
-        logits = self.classifier(x)
+        logits, _ = self.classifier(x)  # Extract logits from tuple
         
         # Get maximum ID class logit
         id_logits = logits[:, :-1]  # All but last class
@@ -239,7 +240,8 @@ class DROInspiredKPlusOne(nn.Module):
         if method == 'gradient':
             # Gradient-based (worst-case direction)
             x.requires_grad_(True)
-            logits = self.classifier(x)[:, :-1]
+            logits, _ = self.classifier(x)  # Extract logits from tuple
+            logits = logits[:, :-1]  # Only original K classes
             loss = F.cross_entropy(logits, y, reduction='none')
             gradients = torch.autograd.grad(loss.sum(), x, create_graph=True)[0]
             
@@ -287,12 +289,13 @@ class DROInspiredKPlusOne(nn.Module):
         ])
         
         # K+1 classification loss
-        logits = self.classifier(x_combined)
+        logits, _ = self.classifier(x_combined)  # Extract logits from tuple
         k_plus_one_loss = F.cross_entropy(logits, y_combined)
         
         # DRO regularization on original samples
         x.requires_grad_(True)
-        orig_logits = self.classifier(x)[:, :-1]
+        orig_logits, _ = self.classifier(x)  # Extract logits from tuple
+        orig_logits = orig_logits[:, :-1]  # Only K classes for DRO
         orig_loss = F.cross_entropy(orig_logits, y, reduction='none')
         
         gradients = torch.autograd.grad(orig_loss.sum(), x, create_graph=True)[0]
@@ -306,7 +309,7 @@ class DROInspiredKPlusOne(nn.Module):
         """
         Compute OOD score based on K+1 classification
         """
-        logits = self.classifier(x)
+        logits, _ = self.classifier(x)  # Extract logits from tuple
         
         id_logits = logits[:, :-1]
         max_id_logit = id_logits.max(1)[0]
