@@ -448,7 +448,8 @@ class WideResNetFeatures(WideResNet):
 def create_model(device, num_classes=10):
     """Create model for energy-constrained DRO"""
     model = WideResNetFeatures(num_classes=1000, pretrained="imagenet32-nocifar")
-    model = torch.compile(model)
+    # Remove torch.compile for speed - it adds compilation overhead
+    # model = torch.compile(model)
     model = model.to(device)
     
     # Get feature dimension
@@ -462,7 +463,7 @@ def create_model(device, num_classes=10):
     
     return model
 
-def create_datasets(root_dir="./data", batch_size=128):
+def create_datasets(root_dir="/Users/tanmoy/research/data", batch_size=128):
     """Create datasets - same as original but simplified for energy approach"""
     trans = WideResNet.transform_for("cifar10-pt")
     
@@ -497,7 +498,7 @@ def main():
     
     # Setup data loaders
     train_loader, test_loader_id, test_loaders_ood = create_datasets(
-        root_dir="/home/tanmoy/research/data",  # Adjust path as needed
+        root_dir="/Users/tanmoy/research/data",  # Adjust path as needed
         batch_size=64
     )
     
