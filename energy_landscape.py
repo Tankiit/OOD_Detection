@@ -69,7 +69,10 @@ class EnergyConstrainedDRO(nn.Module):
         Compute energy score: E(x) = -T * log(sum(exp(f_i(x)/T)))
         Higher energy = more unusual = more likely OOD
         """
-        return -self.temperature * torch.logsumexp(logits / self.temperature, dim=1)
+        # Clamp logits to prevent numerical overflow
+        logits_clamped = torch.clamp(logits, min=-10, max=10)
+        energy = -self.temperature * torch.logsumexp(logits_clamped / self.temperature, dim=1)
+        return energy
     
     def update_id_statistics(self, features: torch.Tensor, logits: torch.Tensor, y: torch.Tensor):
         """Update running statistics of ID data for adaptive thresholding"""
@@ -114,6 +117,8 @@ class EnergyConstrainedDRO(nn.Module):
             # Set threshold to mean + k*std to capture "unusual" samples
             k = 1.5  # Adjustable parameter
             threshold = self.id_energy_mean + k * self.id_energy_std
+            # Clamp threshold to reasonable range
+            threshold = torch.clamp(threshold, min=-5, max=5)
             return threshold.item()
         else:
             return self.energy_threshold
@@ -125,51 +130,59 @@ class EnergyConstrainedDRO(nn.Module):
         Algorithm:
         1. Start with ID sample x_id
         2. Perturb in direction that increases energy
-        3. Stop when energy threshold reached or KL constraint violated
+        3. Stop when energy threshold reached or distance constraint violated
         """
-        x_virtual = x_id.clone().detach().requires_grad_(True)
+        x_virtual = x_id.clone().detach()
         batch_size = x_id.shape[0]
         
         # Get current energy threshold
         current_threshold = self.adaptive_energy_threshold()
         
+        # Use PGD-like approach to increase energy
+        max_steps = 5
+        step_size = 0.001  # Much smaller step size
         successful_generations = 0
-        max_steps = 10
-        step_size = 0.01
         
         for step in range(max_steps):
+            x_virtual.requires_grad_(True)
+            
             # Forward pass to get energy
             logits, features = self.classifier(x_virtual)
             energies = self.compute_energy(logits)
             
             # Check if we've reached energy threshold
             threshold_reached = energies >= current_threshold
-            if threshold_reached.all():
-                successful_generations = batch_size
+            successful_generations = threshold_reached.sum().item()
+            
+            if successful_generations == batch_size:
                 break
             
-            # Compute KL constraint (simplified as feature distance)
-            if self.id_features_mean is not None:
-                kl_constraint = torch.norm(features - self.id_features_mean, dim=1) <= self.kl_radius
-            else:
-                kl_constraint = torch.ones(batch_size, dtype=torch.bool, device=x_id.device)
+            # Compute loss to maximize energy (minimize negative energy)
+            energy_loss = -energies.mean()
             
-            # Only update samples that haven't reached threshold and satisfy KL constraint
-            update_mask = (~threshold_reached) & kl_constraint
-            if not update_mask.any():
-                break
+            # Compute gradient
+            grad = torch.autograd.grad(energy_loss, x_virtual, retain_graph=False)[0]
             
-            # Compute gradient of energy w.r.t. input
-            energy_loss = -energies[update_mask].mean()  # Negative because we want to maximize energy
-            grad = torch.autograd.grad(energy_loss, x_virtual, retain_graph=True)[0]
-            
-            # Update virtual samples
+            # Update in direction of increasing energy
             with torch.no_grad():
-                x_virtual[update_mask] = x_virtual[update_mask] - step_size * grad[update_mask]
-                # Clamp to valid input range
+                # Normalize gradient and take small step
+                grad_norm = torch.norm(grad.view(batch_size, -1), dim=1, keepdim=True)
+                grad_normalized = grad / (grad_norm.view(-1, 1, 1, 1) + 1e-8)
+                
+                x_virtual = x_virtual + step_size * grad_normalized
+                
+                # Clamp to valid image range
                 x_virtual = torch.clamp(x_virtual, 0, 1)
-            
-            x_virtual.requires_grad_(True)
+                
+                # Ensure we don't move too far from original
+                diff = x_virtual - x_id
+                diff_norm = torch.norm(diff.view(batch_size, -1), dim=1, keepdim=True)
+                max_norm = 0.1  # Maximum L2 distance
+                
+                mask = (diff_norm > max_norm).view(-1, 1, 1, 1)
+                if mask.any():
+                    diff_normalized = diff / (diff_norm.view(-1, 1, 1, 1) + 1e-8)
+                    x_virtual = torch.where(mask, x_id + max_norm * diff_normalized, x_virtual)
         
         # Update statistics
         self.virtual_sample_stats['generated_count'] += batch_size
@@ -250,10 +263,13 @@ class EnergyConstrainedDRO(nn.Module):
             
             # Virtual sample loss: encourage high energy (unusual) predictions
             virtual_energies = self.compute_energy(logits_virtual)
-            virtual_loss = -virtual_energies.mean()  # Negative because higher energy is better
+            current_threshold = self.adaptive_energy_threshold()
             
-            # Add consistency loss: virtual samples should be "unusual" but not random
-            consistency_loss = F.mse_loss(features[id_mask], features_virtual)
+            # Loss should be positive when energy is below threshold (not unusual enough)
+            virtual_loss = F.relu(current_threshold - virtual_energies).mean()
+            
+            # Add weaker consistency loss: virtual samples should be different but not too different
+            consistency_loss = 0.1 * F.mse_loss(features[id_mask], features_virtual)
             
         else:
             virtual_loss = torch.tensor(0.0, device=x.device)
@@ -266,7 +282,7 @@ class EnergyConstrainedDRO(nn.Module):
         total_loss = (
             classification_loss + 
             self.lambda_virtual * virtual_loss +
-            0.1 * consistency_loss
+            consistency_loss  # Already scaled in computation above
         )
         
         # Store metrics for monitoring
@@ -392,11 +408,14 @@ def evaluate_energy_constrained(model, id_loader, ood_loaders, criterion, device
         scores_ood = torch.cat(scores_ood)
         
         # Calculate OOD detection metrics
+        # For energy-based detection: higher energy = more likely OOD
+        # But roc_auc_score expects higher scores for positive class (ID=1)
+        # So we negate the energy scores to make lower energy = higher score for ID
         labels = torch.cat([torch.ones(scores_id.size(0)), torch.zeros(scores_ood.size(0))])
         scores = torch.cat([scores_id, scores_ood])
         
-        # For energy-based scoring: higher energy = more likely OOD
-        auroc = roc_auc_score(labels.numpy(), scores.numpy())
+        # Negate scores so that ID (lower energy) gets higher scores
+        auroc = roc_auc_score(labels.numpy(), -scores.numpy())
         
         metrics[f'{dataset_name}_auroc'] = auroc
         
@@ -429,6 +448,7 @@ class WideResNetFeatures(WideResNet):
 def create_model(device, num_classes=10):
     """Create model for energy-constrained DRO"""
     model = WideResNetFeatures(num_classes=1000, pretrained="imagenet32-nocifar")
+    model = torch.compile(model)
     model = model.to(device)
     
     # Get feature dimension
@@ -442,7 +462,7 @@ def create_model(device, num_classes=10):
     
     return model
 
-def create_datasets(root_dir="/Users/tanmoy/research/data", batch_size=128):
+def create_datasets(root_dir="./data", batch_size=128):
     """Create datasets - same as original but simplified for energy approach"""
     trans = WideResNet.transform_for("cifar10-pt")
     
@@ -473,11 +493,11 @@ def main():
     torch.manual_seed(123)
     torch.cuda.empty_cache()
     torch.backends.cudnn.benchmark = True
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Setup data loaders
     train_loader, test_loader_id, test_loaders_ood = create_datasets(
-        root_dir="/Users/tanmoy/research/data",  # Adjust path as needed
+        root_dir="/home/tanmoy/research/data",  # Adjust path as needed
         batch_size=64
     )
     
@@ -488,9 +508,9 @@ def main():
     criterion = EnergyConstrainedDRO(
         classifier=model,
         num_classes=10,
-        energy_threshold=2.0,  # Will be adaptive
+        energy_threshold=0.0,  # Start with reasonable threshold
         kl_radius=0.1,
-        lambda_virtual=0.5,
+        lambda_virtual=0.1,    # Reduced virtual loss weight
         temperature=1.0,
         device=device,
         adaptive_threshold=True
@@ -546,6 +566,15 @@ def main():
             print(f"ID Accuracy: {metrics['id_accuracy']:.4f}")
             print(f"Energy Threshold: {criterion.adaptive_energy_threshold():.2f}")
             print(f"Virtual Success Rate: {criterion.virtual_sample_stats['success_rate']:.2f}")
+            
+            # Debug: Print energy statistics
+            with torch.no_grad():
+                sample_batch = next(iter(test_loader_id))
+                x_sample, y_sample = sample_batch[0][:10].to(device), sample_batch[1][:10].to(device)
+                logits_sample, _ = model(x_sample)
+                energy_sample = criterion.compute_energy(logits_sample)
+                print(f"Sample ID energies: {energy_sample.cpu().numpy()}")
+                print(f"ID energy mean: {criterion.id_energy_mean:.2f}, std: {criterion.id_energy_std:.2f}")
             
             for dataset_name in test_loaders_ood.keys():
                 print(f"{dataset_name} AUROC: {metrics[f'{dataset_name}_auroc']:.4f}")
