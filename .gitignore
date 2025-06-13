@@ -1,3 +1,5 @@
 *
 !rq.py
-!.gitignore 
+!.gitignore
+!influence_manifold_analysis.py 
+!virtual_data_selection.py
