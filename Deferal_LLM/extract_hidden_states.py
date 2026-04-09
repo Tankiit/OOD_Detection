@@ -48,7 +48,8 @@ from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # ── config ────────────────────────────────────────────────────────────────────
-DEFAULT_MODEL   = "google/gemma-2-2b-it"
+# Apache-2.0, no Hugging Face license gating (vs. Gemma / Llama)
+DEFAULT_MODEL   = "Qwen/Qwen2.5-1.5B-Instruct"
 OUTPUT_DIR      = Path("outputs")
 CHECKPOINT_DIR  = OUTPUT_DIR / "checkpoints"
 OUTPUT_FILE     = OUTPUT_DIR / "hidden_states.pt"
@@ -88,6 +89,7 @@ HUMAN_ACC_BY_CATEGORY = {
 
 
 def parse_args():
+    from datasets_loader import DATASET_REGISTRY
     p = argparse.ArgumentParser()
     p.add_argument("--model",          default=DEFAULT_MODEL)
     p.add_argument("--max_questions",  type=int, default=None)
@@ -103,6 +105,13 @@ def parse_args():
     p.add_argument("--skip-sweep",     action="store_true",
                    help="Skip the layer sweep (saves ~5 min)")
     p.add_argument("--expert-threshold", type=float, default=EXPERT_THRESHOLD)
+    p.add_argument(
+        "--dataset",
+        default=None,
+        choices=sorted(DATASET_REGISTRY.keys()),
+        help="If set, load via datasets_loader.load_dataset_records (multi-dataset). "
+             "If omitted, use built-in TruthfulQA loader (same semantics as truthfulqa).",
+    )
     return p.parse_args()
 
 
@@ -124,8 +133,7 @@ def load_model(model_name, device):
 
     kwargs = dict(torch_dtype=torch.float16, low_cpu_mem_usage=True)
     if device.type == "mps":
-        # Gemma-2 and some other models need eager attention on MPS
-        # (SDPA uses ops not yet supported in MPS backend)
+        # Several causal LMs need eager attention on MPS (SDPA gaps on Apple GPU)
         kwargs["attn_implementation"] = "eager"
 
     model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
@@ -178,6 +186,207 @@ def load_truthfulqa(expert_threshold):
     print(f"  Expert reliable (human_acc ≥ {expert_threshold}): "
           f"{n_reliable}/{len(records)} ({n_reliable/len(records)*100:.0f}%)")
     return records
+
+
+def adapt_unified_records(records):
+    """
+    Convert datasets_loader canonical records (wrong_answer) to the
+    internal shape expected by run_extraction (wrong_answers list).
+    """
+    out = []
+    for r in records:
+        w = r.get("wrong_answer")
+        if not w:
+            continue
+        out.append({
+            "question":          r["question"],
+            "best_answer":       r["best_answer"],
+            "wrong_answers":     [w],
+            "category":          r["category"],
+            "human_acc":         r["human_acc"],
+            "y_expert_correct":  r["y_expert_correct"],
+            "y_expert_wrong":    r["y_expert_wrong"],
+        })
+    return out
+
+
+def default_extract_layers(n_total_layers: int, layers_arg):
+    if layers_arg is not None:
+        return layers_arg
+    if n_total_layers >= 80:
+        return 12
+    if n_total_layers >= 42:
+        return 10
+    return 8
+
+
+def run_extraction(
+    args,
+    records,
+    *,
+    device,
+    tokenizer,
+    model,
+    n_total_layers,
+    d_model,
+    extract_layers,
+):
+    """
+    Layer sweep + hidden-state extraction loop + torch.save.
+    `records` must already be in internal format (see adapt_unified_records).
+    Checkpoints and layer_sweep.pt live next to args.output.
+    """
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = output_path.parent / "checkpoints"
+    sweep_path = output_path.parent / "layer_sweep.pt"
+
+    print(f"\n{'='*58}")
+    print(f"  Generation-Discrimination Gap — Step 1")
+    print(f"  Model:       {args.model}")
+    print(f"  Dataset tag: {getattr(args, 'dataset', None) or 'truthfulqa (legacy loader)'}")
+    print(f"  Layers:      last {extract_layers} (of {n_total_layers}) transformer layers")
+    print(f"  Token mode:  {args.token_mode}")
+    print(f"  Expert thr:  {args.expert_threshold}")
+    print(f"{'='*58}")
+
+    if args.max_questions:
+        records = records[: args.max_questions]
+        print(f"  Capped at {len(records)} questions")
+
+    sweep_results = {}
+    best_layer = None
+
+    if not args.skip_sweep:
+        layer_aurocs, best_layer = run_layer_sweep(
+            model, tokenizer, device, records,
+            n_total_layers, args.token_mode,
+            n_sweep=min(50, len(records)),
+        )
+        sweep_results = {
+            "layer_aurocs": layer_aurocs,
+            "best_layer": best_layer,
+            "n_total_layers": n_total_layers,
+        }
+        torch.save(sweep_results, sweep_path)
+        print(f"\n  Sweep saved → {sweep_path}")
+
+    empty_results = lambda: {k: [] for k in [
+        "h_correct", "h_wrong",
+        "lp_correct", "lp_wrong",
+        "questions", "correct_ans", "wrong_ans",
+        "categories", "human_accs",
+        "y_expert_correct", "y_expert_wrong",
+    ]}
+
+    if args.resume:
+        results, start_idx = load_latest_checkpoint(checkpoint_dir)
+        if results is None:
+            print("  No checkpoint found — starting fresh")
+            start_idx = 0
+            results = empty_results()
+    else:
+        start_idx = 0
+        results = empty_results()
+
+    records = records[start_idx:]
+
+    print(f"\nExtracting hidden states ({len(records)} questions remaining)...")
+    print(f"  Token mode: '{args.token_mode}' "
+          f"(first answer token is most factually informative)")
+
+    skipped = 0
+    processed = start_idx
+
+    for i, rec in enumerate(tqdm(records, desc="Questions")):
+        q = rec["question"]
+        c_ans = rec["best_answer"]
+        w_ans = rec["wrong_answers"][0] if rec["wrong_answers"] else None
+
+        if not w_ans:
+            skipped += 1
+            continue
+
+        h_c, lp_c = extract_one(
+            model, tokenizer, device, q, c_ans,
+            extract_layers, args.token_mode,
+        )
+        h_w, lp_w = extract_one(
+            model, tokenizer, device, q, w_ans,
+            extract_layers, args.token_mode,
+        )
+
+        if h_c is None or h_w is None:
+            skipped += 1
+            continue
+
+        results["h_correct"].append(h_c)
+        results["h_wrong"].append(h_w)
+        results["lp_correct"].append(lp_c)
+        results["lp_wrong"].append(lp_w)
+        results["questions"].append(q)
+        results["correct_ans"].append(c_ans)
+        results["wrong_ans"].append(w_ans)
+        results["categories"].append(rec["category"])
+        results["human_accs"].append(rec["human_acc"])
+        results["y_expert_correct"].append(rec["y_expert_correct"])
+        results["y_expert_wrong"].append(rec["y_expert_wrong"])
+        processed += 1
+
+        if (i + 1) % SAVE_EVERY == 0:
+            save_checkpoint(results, processed, checkpoint_dir)
+            tqdm.write(f"  Checkpoint at {processed} questions")
+
+    n_ok = len(results["h_correct"])
+    print(f"\n  Done — processed {n_ok}, skipped {skipped}")
+
+    save_dict = {
+        "h_correct": torch.stack(results["h_correct"]),
+        "h_wrong": torch.stack(results["h_wrong"]),
+        "lp_correct": torch.tensor(results["lp_correct"]),
+        "lp_wrong": torch.tensor(results["lp_wrong"]),
+        "questions": results["questions"],
+        "correct_ans": results["correct_ans"],
+        "wrong_ans": results["wrong_ans"],
+        "categories": results["categories"],
+        "human_accs": results["human_accs"],
+        "y_expert_correct": torch.tensor(
+            results["y_expert_correct"], dtype=torch.long),
+        "y_expert_wrong": torch.tensor(
+            results["y_expert_wrong"], dtype=torch.long),
+        "model": args.model,
+        "n_layers": extract_layers,
+        "token_mode": args.token_mode,
+        "n_questions": n_ok,
+        "d_model": d_model,
+        "n_total_layers": n_total_layers,
+        "sweep": sweep_results,
+        "expert_threshold": args.expert_threshold,
+    }
+    if getattr(args, "dataset", None):
+        save_dict["dataset"] = args.dataset
+
+    torch.save(save_dict, str(output_path))
+
+    lp_c = save_dict["lp_correct"]
+    lp_w = save_dict["lp_wrong"]
+    gap = lp_c - lp_w
+    n_exp = int(save_dict["y_expert_correct"].sum())
+
+    print(f"\nSaved → {output_path}")
+    print(f"  Shape:             {save_dict['h_correct'].shape}")
+    print(f"  lp_correct > lp_wrong:  "
+          f"{(lp_c > lp_w).float().mean()*100:.1f}% of questions")
+    print(f"  Gap mean ± std:    "
+          f"{gap.mean():.3f} ± {gap.std():.3f}")
+    print(f"  Expert-reliable:   {n_exp}/{n_ok} questions "
+          f"(human_acc ≥ {args.expert_threshold})")
+    if sweep_results:
+        bl = sweep_results["best_layer"]
+        ba = sweep_results["layer_aurocs"][bl]
+        print(f"  Best probe layer:  {bl}/{n_total_layers} "
+              f"(AUROC={ba:.4f})")
+    print("\n✓  Step 1 complete — run train_probe.py next")
 
 
 # ── Core extraction ───────────────────────────────────────────────────────────
@@ -362,173 +571,30 @@ def load_latest_checkpoint(checkpoint_dir):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    args   = parse_args()
+    args = parse_args()
     device = get_device()
     OUTPUT_DIR.mkdir(exist_ok=True)
 
     tokenizer, model, n_total_layers, d_model = load_model(args.model, device)
-    
-    if args.layers is None:
-        if n_total_layers >= 80:
-            extract_layers = 12
-        elif n_total_layers >= 42:
-            extract_layers = 10
-        else:
-            extract_layers = 8
+    extract_layers = default_extract_layers(n_total_layers, args.layers)
+
+    if args.dataset:
+        from datasets_loader import load_dataset_records
+        raw = load_dataset_records(args.dataset)
+        records = adapt_unified_records(raw)
     else:
-        extract_layers = args.layers
+        records = load_truthfulqa(args.expert_threshold)
 
-    print(f"\n{'='*58}")
-    print(f"  Generation-Discrimination Gap — Step 1")
-    print(f"  Model:       {args.model}")
-    print(f"  Layers:      last {extract_layers} (of {n_total_layers}) transformer layers")
-    print(f"  Token mode:  {args.token_mode}")
-    print(f"  Expert thr:  {args.expert_threshold}")
-    print(f"{'='*58}")
-
-    records = load_truthfulqa(args.expert_threshold)
-
-    if args.max_questions:
-        records = records[:args.max_questions]
-        print(f"  Capped at {len(records)} questions")
-
-    # ── Layer sweep ───────────────────────────────────────────────────────────
-    sweep_results = {}
-    best_layer    = None
-
-    if not args.skip_sweep:
-        layer_aurocs, best_layer = run_layer_sweep(
-            model, tokenizer, device, records,
-            n_total_layers, args.token_mode,
-            n_sweep=min(50, len(records))
-        )
-        sweep_results = {
-            "layer_aurocs": layer_aurocs,
-            "best_layer":   best_layer,
-            "n_total_layers": n_total_layers,
-        }
-        # Save sweep separately
-        torch.save(sweep_results, OUTPUT_DIR / "layer_sweep.pt")
-        print(f"\n  Sweep saved → outputs/layer_sweep.pt")
-
-    # ── Resume or fresh start ─────────────────────────────────────────────────
-    empty_results = lambda: {k: [] for k in [
-        "h_correct", "h_wrong",
-        "lp_correct", "lp_wrong",
-        "questions", "correct_ans", "wrong_ans",
-        "categories", "human_accs",
-        "y_expert_correct", "y_expert_wrong",
-    ]}
-
-    if args.resume:
-        results, start_idx = load_latest_checkpoint(CHECKPOINT_DIR)
-        if results is None:
-            print("  No checkpoint found — starting fresh")
-            start_idx = 0
-            results   = empty_results()
-    else:
-        start_idx = 0
-        results   = empty_results()
-
-    records = records[start_idx:]
-
-    # ── Extraction loop ───────────────────────────────────────────────────────
-    print(f"\nExtracting hidden states "
-          f"({len(records)} questions remaining)...")
-    print(f"  Token mode: '{args.token_mode}' "
-          f"(first answer token is most factually informative)")
-
-    skipped       = 0
-    processed     = start_idx
-
-    for i, rec in enumerate(tqdm(records, desc="Questions")):
-        q     = rec["question"]
-        c_ans = rec["best_answer"]
-        w_ans = rec["wrong_answers"][0] if rec["wrong_answers"] else None
-
-        if not w_ans:
-            skipped += 1
-            continue
-
-        h_c, lp_c = extract_one(
-            model, tokenizer, device, q, c_ans,
-            extract_layers, args.token_mode
-        )
-        h_w, lp_w = extract_one(
-            model, tokenizer, device, q, w_ans,
-            extract_layers, args.token_mode
-        )
-
-        if h_c is None or h_w is None:
-            skipped += 1
-            continue
-
-        results["h_correct"].append(h_c)
-        results["h_wrong"].append(h_w)
-        results["lp_correct"].append(lp_c)
-        results["lp_wrong"].append(lp_w)
-        results["questions"].append(q)
-        results["correct_ans"].append(c_ans)
-        results["wrong_ans"].append(w_ans)
-        results["categories"].append(rec["category"])
-        results["human_accs"].append(rec["human_acc"])
-        results["y_expert_correct"].append(rec["y_expert_correct"])
-        results["y_expert_wrong"].append(rec["y_expert_wrong"])
-        processed += 1
-
-        if (i + 1) % SAVE_EVERY == 0:
-            save_checkpoint(results, processed, CHECKPOINT_DIR)
-            tqdm.write(f"  Checkpoint at {processed} questions")
-
-    N = len(results["h_correct"])
-    print(f"\n  Done — processed {N}, skipped {skipped}")
-
-    # ── Save ──────────────────────────────────────────────────────────────────
-    save_dict = {
-        "h_correct":        torch.stack(results["h_correct"]),      # (N, d)
-        "h_wrong":          torch.stack(results["h_wrong"]),        # (N, d)
-        "lp_correct":       torch.tensor(results["lp_correct"]),    # (N,)
-        "lp_wrong":         torch.tensor(results["lp_wrong"]),      # (N,)
-        "questions":        results["questions"],
-        "correct_ans":      results["correct_ans"],
-        "wrong_ans":        results["wrong_ans"],
-        "categories":       results["categories"],
-        "human_accs":       results["human_accs"],
-        "y_expert_correct": torch.tensor(
-            results["y_expert_correct"], dtype=torch.long),         # (N,)
-        "y_expert_wrong":   torch.tensor(
-            results["y_expert_wrong"],   dtype=torch.long),         # (N,)
-        "model":            args.model,
-        "n_layers":         extract_layers,
-        "token_mode":       args.token_mode,
-        "n_questions":      N,
-        "d_model":          d_model,
-        "n_total_layers":   n_total_layers,
-        "sweep":            sweep_results,
-        "expert_threshold": args.expert_threshold,
-    }
-    torch.save(save_dict, args.output)
-
-    # Sanity stats
-    lp_c = save_dict["lp_correct"]
-    lp_w = save_dict["lp_wrong"]
-    gap  = lp_c - lp_w
-    n_exp = int(save_dict["y_expert_correct"].sum())
-
-    print(f"\nSaved → {args.output}")
-    print(f"  Shape:             {save_dict['h_correct'].shape}")
-    print(f"  lp_correct > lp_wrong:  "
-          f"{(lp_c > lp_w).float().mean()*100:.1f}% of questions")
-    print(f"  Gap mean ± std:    "
-          f"{gap.mean():.3f} ± {gap.std():.3f}")
-    print(f"  Expert-reliable:   {n_exp}/{N} questions "
-          f"(human_acc ≥ {args.expert_threshold})")
-    if sweep_results:
-        bl = sweep_results["best_layer"]
-        ba = sweep_results["layer_aurocs"][bl]
-        print(f"  Best probe layer:  {bl}/{n_total_layers} "
-              f"(AUROC={ba:.4f})")
-    print("\n✓  Step 1 complete — run train_probe.py next")
+    run_extraction(
+        args,
+        records,
+        device=device,
+        tokenizer=tokenizer,
+        model=model,
+        n_total_layers=n_total_layers,
+        d_model=d_model,
+        extract_layers=extract_layers,
+    )
 
 
 if __name__ == "__main__":
