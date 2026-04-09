@@ -1,3 +1,20 @@
-*
-!rq.py
-!.gitignore 
+# Serialized model weights / tensors (never commit)
+*.pt
+*.pth
+*.ckpt
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Typical local artifact dirs from scripts in this repo
+outputs/
